@@ -3,44 +3,6 @@
 . /lib/functions.sh
 . /lib/upgrade/nand.sh
 
-led_pink() {
-	echo 0 > /sys/class/leds/red:status/brightness
-	echo 0 > /sys/class/leds/green:status/brightness
-	echo 0 > /sys/class/leds/blue:status/brightness
-	echo 80 > /sys/class/leds/green:status/brightness
-	echo 32 > /sys/class/leds/red:status/brightness
-	echo 48 > /sys/class/leds/blue:status/brightness
-	echo timer > /sys/class/leds/green:status/trigger
-	echo 1 > /sys/class/leds/green:status/delay_on
-	echo 70 > /sys/class/leds/green:status/delay_off
-}
-
-led_red() {
-	echo 0 > /sys/class/leds/red:status/brightness
-	echo 0 > /sys/class/leds/green:status/brightness
-	echo 0 > /sys/class/leds/blue:status/brightness
-	echo 255 > /sys/class/leds/red:status/brightness
-	echo timer > /sys/class/leds/red:status/trigger
-	echo 120 > /sys/class/leds/red:status/delay_on
-	echo 200 > /sys/class/leds/red:status/delay_off
-}
-
-led_green() {
-	echo 0 > /sys/class/leds/red:status/brightness
-	echo 0 > /sys/class/leds/green:status/brightness
-	echo 0 > /sys/class/leds/blue:status/brightness
-	echo 255 > /sys/class/leds/green:status/brightness
-}
-
-trigger_crash() {
-	led_red
-	sleep 5
-	echo "INSTALLER: $@" > /dev/kmsg
-	echo c > /proc/sysrq-trigger
-}
-
-led_pink
-
 sleep 1
 
 echo
@@ -48,9 +10,9 @@ echo OpenWrt UBI installer
 echo
 
 INSTALLER_DIR="/installer"
-PRELOADER="$INSTALLER_DIR/mt7988-spim-nand-ubi-ddr4-bl2.img"
-FIP="$INSTALLER_DIR/mt7988_asus_zenwifi-bt8-u-boot.fip"
-RECOVERY="$(ls -1 $INSTALLER_DIR/openwrt-*mediatek-filogic-asus_zenwifi-bt8-ubootmod-initramfs-recovery.itb)"
+PRELOADER="$INSTALLER_DIR/openwrt-mediatek-filogic-qihoo_360t7-ubi-preloader.bin"
+FIP="$INSTALLER_DIR/openwrt-mediatek-filogic-qihoo_360t7-ubi-bl31-uboot.fip"
+RECOVERY="$(ls -1 $INSTALLER_DIR/openwrt-mediatek-filogic-qihoo_360t7-ubi-initramfs-recovery.itb)"
 HAS_ENV=1
 HAS_FIP=1
 HAS_FACTORY=1
@@ -67,44 +29,62 @@ ubi_mknod() {
 	mknod "/dev/$dev" c $MAJOR $MINOR
 }
 
-extract_ubi_volumes() {
-	local mtdname="$1"
-	local ubinum=31
-	local mtdnum="$(find_mtd_index "$mtdname")"
-	local voldev
-	shift
+install_get_factory() {
+	local mtddev="$1"
+	local ebs=$(cat /sys/class/mtd/$(basename $mtddev)/erasesize)
+	local assertm="$3"
+	local init_off="$2"
+	local off=$init_off
+	local skip="$((init_off / ebs))"
+	local found
 
-	for volname in "$@"; do
-		[ -e "/tmp/$volname" ] && return 1
+	while [ $((off)) -lt $((init_off + 4 * ebs)) ]; do
+		magic="$(hexdump -v -s $off -n 2 -e '"%02x"' $1)"
+		if [ "$magic" = "$assertm" ]; then
+			found=1
+			break
+		fi
+		off=$((off + ebs))
+		skip=$((skip + 1))
 	done
 
-	ubiattach -m "$mtdnum" -d "$ubinum"
-	ubi_mknod "/dev/ubi$ubinum"
-	for volname in "$@"; do
-		voldev="$(nand_find_volume "ubi$ubinum" "$volname")"
-		[ "$voldev" ] || return 1
-		dd if="/dev/$voldev" of="/tmp/$volname"
-	done
-	ubidetach -d "$ubinum"
-	return 0
+	if [ "$found" != "1" ]; then
+		echo "factory partition not found on raw flash offset"
+		return 1
+	fi
+
+	echo -n "found factory partition at offset $(printf %08x $((off)))"
+
+	dd if=$mtddev bs=$ebs skip=$skip count=1 of=/tmp/Factory.bin
 }
 
-install_prepare_mtd_backup() {
-	echo "preparing backup of relevant flash areas..."
-	mkdir /tmp/backup
-	for mtdnum in $(seq 0 $1); do
-		local ebs=$(cat /sys/class/mtd/mtd${mtdnum}/erasesize)
-		dd bs=$ebs if=/dev/mtd${mtdnum} of=/tmp/backup/mtd${mtdnum} ${2:+count=$2}
-	done
-}
+install_get_macblock() {
+	local mtddev="$1"
+	local ebs=$(cat /sys/class/mtd/$(basename $mtddev)/erasesize)
+	local assertm="$3"
+	local init_off="$2"
+	local off=$init_off
+	local skip="$((init_off / ebs))"
+	local found
 
-install_write_backup() {
-	echo "writing backup files to ubi volume..."
-	ubimkvol /dev/ubi0 -n 6 -s 8MiB -N boot_backup
-	ubi_mknod ubi0_6
-	mount -t ubifs /dev/ubi0_6 /mnt
-	cp /tmp/backup/mtd* /mnt
-	umount /mnt
+	while [ $((off)) -lt $((init_off + 4 * ebs)) ]; do
+		magic="$(hexdump -v -s $off -n 2 -e '"%02x"' $1)"
+		if [ "$magic" = "$assertm" ]; then
+			found=1
+			break
+		fi
+		off=$((off + ebs))
+		skip=$((skip + 1))
+	done
+
+	if [ "$found" != "1" ]; then
+		echo "MAC partition not found on raw flash offset"
+		return 1
+	fi
+
+	echo -n "Found MAC partition at offset $(printf %08x $((off)))"
+
+	dd if=$mtddev bs=$ebs skip=$skip count=1 of=/tmp/factory.bin
 }
 
 install_prepare_ubi() {
@@ -116,46 +96,49 @@ install_prepare_ubi() {
 	sync
 	sleep 1
 	[ -e /dev/ubi0 ] || ubi_mknod ubi0
-	[ "$HAS_FIP" = "1" ] && ubimkvol /dev/ubi0 -n 0 -t static -s $(cat $FIP | wc -c) -N fip && ubi_mknod ubi0_0 && ubiupdatevol /dev/ubi0_0 "$FIP"
-	[ "$HAS_FACTORY" = "1" ] && ubimkvol /dev/ubi0 -n 1 -t static -s $(cat "/tmp/factory" | wc -c) -N factory && ubi_mknod ubi0_1 && ubiupdatevol /dev/ubi0_1 "/tmp/factory"
-	[ "$HAS_ENV" = "1" ] && ubimkvol /dev/ubi0 -n 2 -s 126976 -N ubootenv && ubimkvol /dev/ubi0 -n 3 -s 126976 -N ubootenv2
+	[ "$HAS_FIP" = "1" ] && \
+		ubimkvol /dev/ubi0 -n 0 -t static -s 1MiB -N fip && \
+		ubi_mknod ubi0_0 && \
+		ubiupdatevol /dev/ubi0_0 "$FIP"
+	[ "$HAS_FACTORY" = "1" ] && \
+		ubimkvol /dev/ubi0 -n 1 -t static -s 0x10000 -N factory && \
+		ubi_mknod ubi0_1 && \
+		ubiupdatevol /dev/ubi0_1 "/tmp/ubi_factory.bin"
+	[ "$HAS_ENV" = "1" ] && \
+		ubimkvol /dev/ubi0 -n 2 -s 0x1f000 -N ubootenv && \
+		ubimkvol /dev/ubi0 -n 3 -s 0x1f000 -N ubootenv2
 }
 
+# extract wifi eeprom from Factory MTD partition
+install_get_factory  /dev/mtd1 0x80000   "7981" || \
+	trigger_crash "Cannot find Wi-Fi EEPROM data"
+install_get_macblock /dev/mtd1 0x7180000 "7768" || \
+	trigger_crash "Cannot find MAC"
 
-led_pink() {
-	echo 20 > /sys/class/leds/green:status/brightness
-	echo 220 > /sys/class/leds/red:status/brightness
-	echo 80 > /sys/class/leds/blue:status/brightness
-}
+dd if=/dev/zero bs=$((0x8000)) count=1 | tr '\000' '\377' > \
+	/tmp/ubi_factory.bin
+dd if=/tmp/Factory.bin bs=1 count=$((0x1000)) of=/tmp/ubi_factory.bin conv=notrunc
+cat /tmp/factory.bin | grep lanMac | sed 's/lanMac=\|://g' > /tmp/mac
+printf "$(cat /tmp/mac | sed 's/../\\x&/g')" >> /tmp/ubi_factory.bin
 
-# backup mtd0...mtd1, max. 16x 128kb block each (ie. 0x0~0x400000)
-install_prepare_mtd_backup 1 16
-
-extract_ubi_volumes OLD_UBI_DEV Factory Factory2 nvram || trigger_crash "Error extracting factory data"
-
-cp /tmp/Factory /tmp/factory
-mv /tmp/nvram /tmp/Factory* /tmp/backup
-
-echo "redundantly write bl2"
-for bl2start in 0x0 0x80000 0x100000 0x180000; do
+#echo "redundantly write bl2"
+insmod mtd-rw i_want_a_brick=1
+mtd unlock bl2
+for bl2start in 0x0 0x80000; do
 	mtd -p $bl2start write $PRELOADER /dev/mtd0
 done
 
-install_prepare_ubi /dev/mtd$(find_mtd_index "NEW_UBI_DEV")
-
-echo "write recovery ubi volume"
-RECOVERY_SIZE=$(cat $RECOVERY | wc -c)
-ubimkvol /dev/ubi0 -n 4 -s $RECOVERY_SIZE -N recovery
-ubi_mknod ubi0_4
-ubiupdatevol /dev/ubi0_4 $RECOVERY
-ubimkvol /dev/ubi0 -n 5 -s 126976 -N fit
-
-install_write_backup
+install_prepare_ubi /dev/mtd$(find_mtd_index "ubi")
 
 sync
 
-led_green
+#echo "write recovery ubi volume"
+#RECOVERY_SIZE=$(cat $RECOVERY | wc -c)
+#ubimkvol /dev/ubi0 -n 4 -s $RECOVERY_SIZE -N recovery
+#ubi_mknod ubi0_4
+#ubiupdatevol /dev/ubi0_4 $RECOVERY
+#ubimkvol /dev/ubi0 -n 5 -s 0x1f000 -N fit
 
 sleep 5
 
-reboot -f
+#reboot -f
