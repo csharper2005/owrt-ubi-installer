@@ -14,7 +14,13 @@ PRELOADER="$INSTALLER_DIR/bl2.bin"
 FIP="$INSTALLER_DIR/fip.bin"
 
 install_prepare_ubi() {
-	ubidetach -p /dev/mtd2; ubiformat /dev/mtd2 -y; ubiattach -p /dev/mtd2
+	ubidetach -p /dev/mtd2 2>/dev/null || true
+	ubiformat /dev/mtd2 -y
+	ubiattach -p /dev/mtd2
+
+	while [ ! -d /sys/class/ubi/ubi0 ]; do sleep 1; done
+	ubi_mknod ubi0 || true
+	[ -e /dev/ubi0 ] || mknod /dev/ubi0 c $(cut -d: -f1 /sys/class/ubi/ubi0/dev) $(cut -d: -f2 /sys/class/ubi/ubi0/dev)
 
 	ubimkvol /dev/ubi0 -n 0 -t static -s 1048576 -N fip && \
 		ubi_mknod ubi0_0 && \
